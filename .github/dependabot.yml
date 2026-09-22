@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # The only dependencies here are the pinned actions. The debian:trixie-slim
+  # base image is tracked by tag, and build.yml's daily digest check rebuilds
+  # it, so Dependabot has nothing to do for the Dockerfile.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*" # Groups all action updates into one weekly PR to avoid noise
