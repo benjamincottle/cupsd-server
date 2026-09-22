@@ -68,6 +68,11 @@ jobs:
       - name: hadolint
         run: ./hadolint Dockerfile
 
+      # hadolint only checks the shell inside RUN; the entrypoint script is
+      # checked separately. shellcheck is preinstalled on the runner.
+      - name: shellcheck entrypoint.sh
+        run: shellcheck entrypoint.sh
+
   # build.yml only runs on main, so without this a broken Dockerfile is not
   # discovered until after the merge. Skipped only on a main push, where
   # build.yml does the real build and running both would build it twice;
@@ -97,18 +102,71 @@ jobs:
           load: true
           tags: cupsd-server:ci
 
-      # A successful build doesn't prove cupsd can start with the image's
-      # config, so start it and ask the scheduler whether it's running.
-      - name: Check cupsd starts
+      # The entrypoint must refuse to start without an admin password rather
+      # than fall back to a default one. timeout catches a container that
+      # starts anyway (exit 124) instead of letting the job hang.
+      - name: Check it refuses to start without a password
         run: |
-          docker run -d --name cupsd cupsd-server:ci
+          rc=0
+          timeout 20 docker run --rm --name cupsd-nopw cupsd-server:ci || rc=$?
+          docker rm -f cupsd-nopw >/dev/null 2>&1 || true
+          if [ "$rc" -ne 1 ]; then
+            echo "expected exit 1 without a password, got $rc"
+            exit 1
+          fi
+
+      # A successful build doesn't prove cupsd works with the image's config,
+      # so start it the way it's deployed and check it from outside.
+      - name: Check cupsd works
+        env:
+          PASSWORD: ci-test-password
+        run: |
+          docker run -d --name cupsd -p 127.0.0.1:631:631 \
+            -e CUPS_ADMIN_PASSWORD="$PASSWORD" cupsd-server:ci
+
+          fail() {
+            echo "FAILED: $1"
+            docker logs cupsd
+            exit 1
+          }
+          # Prints the HTTP status for a URL on the published port.
+          status() {
+            curl -s -o /dev/null -w '%{http_code}' "$@"
+          }
+
           for _ in $(seq 1 30); do
             if docker exec cupsd lpstat -r 2>/dev/null | grep -q 'scheduler is running'; then
-              echo "cupsd is running"
-              exit 0
+              break
             fi
             sleep 1
           done
-          echo "cupsd did not report running within 30s"
-          docker logs cupsd
-          exit 1
+          docker exec cupsd lpstat -r | grep -q 'scheduler is running' \
+            || fail "cupsd did not report running within 30s"
+          echo "ok: cupsd is running"
+
+          [ "$(status http://127.0.0.1:631/)" = 200 ] \
+            || fail "web interface not reachable through the published port"
+          echo "ok: reachable through the published port"
+
+          # Over plain HTTP, CUPS answers 426 so the browser switches to HTTPS
+          # (a self-signed certificate CUPS generates) before sending the
+          # password. The login itself is checked over HTTPS.
+          [ "$(status http://127.0.0.1:631/admin/)" = 426 ] \
+            || fail "admin pages over HTTP aren't upgraded to HTTPS"
+          echo "ok: admin pages over HTTP are upgraded to HTTPS"
+
+          [ "$(status -k https://127.0.0.1:631/admin/)" = 401 ] \
+            || fail "admin pages don't ask for a login"
+          echo "ok: admin pages ask for a login"
+
+          [ "$(status -k -u admin:wrong-password https://127.0.0.1:631/admin/)" = 401 ] \
+            || fail "admin login accepted a wrong password"
+          echo "ok: a wrong admin password is rejected"
+
+          [ "$(status -k -u "admin:$PASSWORD" https://127.0.0.1:631/admin/)" = 200 ] \
+            || fail "admin login with the configured password was rejected"
+          echo "ok: admin login works with the configured password"
+
+          docker exec cupsd lpinfo -m | grep -q 'Brother HL-2030 Foomatic/hl1250' \
+            || fail "the Brother HL-2030 hl1250 driver is missing"
+          echo "ok: Brother HL-2030 Foomatic/hl1250 driver is available"

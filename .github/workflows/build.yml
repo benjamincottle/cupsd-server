@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - cupsd.conf
+      - entrypoint.sh
       - .github/workflows/build.yml
   schedule:
     # Daily upstream-digest check for debian:trixie-slim. A new digest also
