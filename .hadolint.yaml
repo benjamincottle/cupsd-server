@@ -1,0 +1,7 @@
+ignored:
+  # Pinning apt package versions would stop the daily rebuild from picking up
+  # Debian's security updates, which is the point of that rebuild.
+  - DL3008
+  # TEMPORARY: the only pipe is `echo 'admin:admin' | chpasswd`, which goes
+  # away when the hardcoded password is removed. Drop this entry then.
+  - DL4006

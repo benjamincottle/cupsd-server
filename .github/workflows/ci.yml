@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # Workflow syntax errors are caught on the PR
+  # rather than after they have already landed on main.
+  lint-workflows:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+        run: |
+          curl -sSfL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_arm64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+
+      # Exits non-zero on any finding; also runs shellcheck on run: scripts.
+      - name: actionlint
+        run: ./actionlint -color
+
+  # Dockerfile best-practice checks. Accepted findings, each with its reason,
+  # live in .hadolint.yaml so a local `hadolint Dockerfile` matches CI.
+  lint-dockerfile:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The official release binary, checked against its published checksum.
+      # Dependabot can't bump this: update the version and checksum by hand
+      # from the release's checksums.sha256.
+      - name: Install hadolint
+        env:
+          HADOLINT_VERSION: 2.15.1
+          HADOLINT_SHA256: f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
+        run: |
+          curl -sSfL -o hadolint \
+            "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-arm64"
+          echo "${HADOLINT_SHA256}  hadolint" | sha256sum -c -
+          chmod +x hadolint
+
+      # Exits non-zero on any finding not ignored in .hadolint.yaml.
+      - name: hadolint
+        run: ./hadolint Dockerfile
+
+  # build.yml only runs on main, so without this a broken Dockerfile is not
+  # discovered until after the merge. Skipped only on a main push, where
+  # build.yml does the real build and running both would build it twice;
+  # pull_request and workflow_dispatch both still validate it.
+  docker-build:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      # load: true puts the image into the runner's Docker so the next step
+      # can start it.
+      - name: Build image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: cupsd-server:ci
+
+      # A successful build doesn't prove cupsd can start with the image's
+      # config, so start it and ask the scheduler whether it's running.
+      - name: Check cupsd starts
+        run: |
+          docker run -d --name cupsd cupsd-server:ci
+          for _ in $(seq 1 30); do
+            if docker exec cupsd lpstat -r 2>/dev/null | grep -q 'scheduler is running'; then
+              echo "cupsd is running"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "cupsd did not report running within 30s"
+          docker logs cupsd
+          exit 1
